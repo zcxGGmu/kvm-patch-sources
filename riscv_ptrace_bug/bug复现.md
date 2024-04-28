@@ -40,3 +40,26 @@
    > - `test`
    >   - **print all argument passed by `execve syscall` , also the `envp`**
    > - **if ptrace execute success , `test` will not be excuted , but actually , `./test` works well .**
+
+---
+
+# 1 log
+
+修改 test 运行时寄存器，场景如下：
+
+* 将 `a0 ~ a6` 置0：
+
+  ![image-20240428170606653](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281706727.png)
+
+* 只将 `a0` 置0，其余不变：
+
+  ![image-20240428170839825](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281708851.png)
+
+* 将 `a0/a1` 置为0，其余不变：
+
+  ![image-20240428171118802](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281711828.png)
+
+* 将 `a0/a2` 置为0，其余不变：
+
+  ![image-20240428171248450](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281712474.png)
+
