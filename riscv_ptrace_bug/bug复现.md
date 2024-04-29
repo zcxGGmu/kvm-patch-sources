@@ -1,7 +1,5 @@
-# 0 计划
+# 0 bug复现
 
-> [Jer6y/rv_linux_bug: a descrption for a riscv linux bug (github.com)](https://github.com/Jer6y/rv_linux_bug)
->
 > [218701 – tracer can't change a0 in tracee when use ptrace syscall option in riscv (kernel.org)](https://bugzilla.kernel.org/show_bug.cgi?id=218701)
 
 1. bug产生环境如下：
@@ -10,11 +8,6 @@
    > - **OS Distribution: openEuler 23.09 RISCV community**
    > - **Linux Kernel Version: 6.4.0**
    > - **Bug Description : when i am trying to use ptrace for tracer to change the tracee's a0 register in riscv linux when tracee is trace stopped by `PTRACE_SYSCALL`, actually , it doesn't change a0 , but it actually can change a1 ... a7 and other registers**
-
-   [通过 QEMU 仿真 RISC-V 环境并启动 openEuler RISC-V 系统](https://www.openeuler.org/zh/blog/phoebe/2023-09-26-Run-openEuler-RISC-V-On-Qemu.html)
-
-   - [ ] 换内核；
-   - [ ] 或者不用Euler环境，6.4.0内核即可？
 
 2. bug复现：
 
@@ -47,10 +40,6 @@
 
 修改 test 运行时寄存器，场景如下：
 
-* 将 `a0 ~ a6` 置0：
-
-  ![image-20240428170606653](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281706727.png)
-
 * 只将 `a0` 置0，其余不变：
 
   ![image-20240428170839825](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281708851.png)
@@ -63,3 +52,6 @@
 
   ![image-20240428171248450](https://cdn.jsdelivr.net/gh/MaskerDad/BlogImage@main/202404281712474.png)
 
+# 2 产生原因
+
+[[PATCH\] riscv: entry: Save a0 prior syscall_enter_from_user_mode() (kernel.org)](https://lore.kernel.org/lkml/20230403-crisping-animosity-04ed8a45c625@spud/T/)
