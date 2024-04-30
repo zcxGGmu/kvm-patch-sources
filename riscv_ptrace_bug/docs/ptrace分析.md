@@ -276,3 +276,368 @@ ecall或者ebreak异常。ecall异常又可以分为ecall from U mode、ecall fr
 [Linux内核riscv head.S分析 | Sherlock's blog (wangzhou.github.io)](https://wangzhou.github.io/Linux内核riscv-head-S分析/)
 
 [Linux内核riscv entry.S分析 | Sherlock's blog (wangzhou.github.io)](https://wangzhou.github.io/Linux内核riscv-entry-S分析/)
+
+---
+
+#### 一些前置知识
+
+##### riscv汇编/kernel
+
+```assembly
+#define __ASM_STR(x)	x
+#define __REG_SEL(a, b)	__ASM_STR(a)
+#define REG_S		__REG_SEL(sd, sw)
+#define REG_L		__REG_SEL(ld, lw)
+ld rd, offset(rs1) 		# x[rd] = M[x[rs1] + sext(offset)][63:0]
+sd rs2, offset(rs1) M[x[rs1] + sext(offset) = x[rs2][63: 0]
+
+/*
+	arch/riscv/kernel/asm-offsets.c定义了很多struct相对于首地址的偏移量，
+	其目的是利用sp/tp指针保存/恢复context.
+	OFFSET宏定义在: include/linux/kbuild.h
+	参考: https://blog.csdn.net/gzxb1995/article/details/105066070
+*/
+#define DEFINE(sym, val) \
+	asm volatile("\n.ascii \"->" #sym " %0 " #val "\"" : : "i" (val))
+#define OFFSET(sym, str, mem) \
+	DEFINE(sym, offsetof(struct str, mem))
+#define offsetof(TYPE, MEMBER)	__builtin_offsetof(TYPE, MEMBER)
+
+/* PT_*(sp) */
+OFFSET(PT_RA, pt_regs, ra); => #define PT_RA(x) //...
+
+/* TASK_TI_*(tp) */
+OFFSET(TASK_TI_KERNEL_SP, task_struct, thread_info.kernel_sp);
+OFFSET(TASK_TI_USER_SP, task_struct, thread_info.user_sp);
+
+li rd, immediate	 	# x[rd] = immediate
+la rd, symbol 			# x[rd] = &symbol
+j offset 				# pc += sext(offset)
+jr rs1 					# pc = x[rs1]
+jal rd, offset 			# x[rd] = pc+4; pc += sext(offset)
+jalr rd, offset(rs1) 	# t =pc+4; pc=(x[rs1]+sext(offset))&~1; x[rd]=t
+tail symbol 			# pc = &symbol; clobber x[6]
+add rd, rs1, rs2 		# x[rd] = x[rs1] + x[rs2]
+
+csrrw rd, csr, zimm[4:0] # (csrrw tp, CSR, tp) t = CSRs[csr]; CSRs[csr] = x[rs1]; x[rd] = t
+csrrc rd, csr, rs1 		 # t = CSRs[csr]; CSRs[csr] = t &~x[rs1]; x[rd] = t
+csrr rd, csr 			 # x[rd] = CSRs[csr]
+csrw csr, rs1 			 # CSRs[csr] = x[rs1]
+
+addi rd, rs1, immediate  # x[rd] = x[rs1] + sext(immediate)
+andi rd, rs1, immediate  # x[rd] = x[rs1] & sext(immediate)
+srli rd, rs1, shamt 	 # x[rd] = (x[rs1] ≫𝑢 shamt)
+slli rd, rs1, shamt      # x[rd] = x[rs1] ≪ shamt
+
+bnez rs1, offset 		 # if (rs1 ≠ 0) pc += sext(offset) <=>  bne rs1, x0, offset
+bge rs1, rs2, offset     # if (rs1 ≥s rs2) pc += sext(offset)
+bgeu rs1, rs2, offset 	 # if (rs1 ≥u rs2) pc += sext(offset)
+```
+
+##### task_struct/pt_regs/kernel_stack
+
+```c
+struct task_struct {
+    struct thread_info		thread_info;
+    /* CPU-specific state of this task: */
+	struct thread_struct		thread;
+}
+
+// arch/riscv/include/asm/thread_info.h
+/*
+ * low level task data that entry.S needs immediate access to
+ * - this struct should fit entirely inside of one cache line
+ * - if the members of this struct changes, the assembly constants
+ *   in asm-offsets.c must be updated accordingly
+ * - thread_info is included in task_struct at an offset of 0.  This means that
+ *   tp points to both thread_info and task_struct.
+ */
+struct thread_info {
+	unsigned long   flags;		/* low level flags */
+	int             preempt_count;  /* 0=>preemptible, <0=>BUG */
+	/*
+	 * These stack pointers are overwritten on every system call or
+	 * exception.  SP is also saved to the stack it can be recovered when
+	 * overwritten.
+	 */
+	long			kernel_sp;	/* Kernel stack pointer */
+	long			user_sp;	/* User stack pointer */
+	int				cpu;
+	unsigned long	syscall_work;	/* SYSCALL_WORK_ flags */
+};
+
+/* CPU-specific state of a task */
+struct thread_struct {
+	/* Callee-saved registers */
+	unsigned long ra;
+	unsigned long sp;	/* Kernel mode stack */
+	unsigned long s[12];	/* s[0]: frame pointer */
+	unsigned long bad_cause;
+	unsigned long align_ctl;
+};
+
+// arch/riscv/include/asm/ptrace.h
+struct pt_regs {
+	unsigned long epc;
+	unsigned long ra;
+	unsigned long sp;
+	unsigned long gp;
+	unsigned long tp;
+	unsigned long t0;
+	unsigned long t1;
+	unsigned long t2;
+	unsigned long s0;
+	unsigned long s1;
+	unsigned long a0;
+	unsigned long a1;
+	unsigned long a2;
+	unsigned long a3;
+	unsigned long a4;
+	unsigned long a5;
+	unsigned long a6;
+	unsigned long a7;
+	unsigned long s2;
+	unsigned long s3;
+	unsigned long s4;
+	unsigned long s5;
+	unsigned long s6;
+	unsigned long s7;
+	unsigned long s8;
+	unsigned long s9;
+	unsigned long s10;
+	unsigned long s11;
+	unsigned long t3;
+	unsigned long t4;
+	unsigned long t5;
+	unsigned long t6;
+	/* Supervisor/Machine CSRs */
+	unsigned long status;
+	unsigned long badaddr;
+	unsigned long cause;
+	/* a0 value before the syscall */
+	unsigned long orig_a0;
+};
+```
+
+
+
+
+
+
+
+#### 代码分析
+
+直接在代码里写注释，段注释用 `n:` 开头，行注释直接 `#`，这里把 `CONFIG_*` 都删了，只保留syscall调用链相关的代码。
+
+##### head.S
+
+- [ ] 系统启动时，scratch/tp寄存器如何设置的？
+
+
+
+##### entry.S
+
+```assembly
+SYM_CODE_START(handle_exception)
+	/*
+	 * If coming from userspace, preserve the user thread pointer and load
+	 * the kernel thread pointer.  If we came from the kernel, the scratch
+	 * register will contain 0, and we should continue on the current TP.
+	 */
+	csrrw tp, CSR_SCRATCH, tp # 
+	bnez tp, .Lsave_context
+
+.Lrestore_kernel_tpsp:
+	csrr tp, CSR_SCRATCH
+	REG_S sp, TASK_TI_KERNEL_SP(tp)
+
+.Lsave_context:
+	REG_S sp, TASK_TI_USER_SP(tp)
+	REG_L sp, TASK_TI_KERNEL_SP(tp)
+	addi sp, sp, -(PT_SIZE_ON_STACK)
+	REG_S x1,  PT_RA(sp)
+	REG_S x3,  PT_GP(sp)
+	REG_S x5,  PT_T0(sp)
+	save_from_x6_to_x31
+
+	/*
+	 * Disable user-mode memory access as it should only be set in the
+	 * actual user copy routines.
+	 *
+	 * Disable the FPU/Vector to detect illegal usage of floating point
+	 * or vector in kernel space.
+	 */
+	li t0, SR_SUM | SR_FS_VS
+
+	REG_L s0, TASK_TI_USER_SP(tp)
+	csrrc s1, CSR_STATUS, t0
+	csrr s2, CSR_EPC
+	csrr s3, CSR_TVAL
+	csrr s4, CSR_CAUSE
+	csrr s5, CSR_SCRATCH
+	REG_S s0, PT_SP(sp)
+	REG_S s1, PT_STATUS(sp)
+	REG_S s2, PT_EPC(sp)
+	REG_S s3, PT_BADADDR(sp)
+	REG_S s4, PT_CAUSE(sp)
+	REG_S s5, PT_TP(sp)
+
+	/*
+	 * Set the scratch register to 0, so that if a recursive exception
+	 * occurs, the exception vector knows it came from the kernel
+	 */
+	csrw CSR_SCRATCH, x0
+
+	/* Load the global pointer */
+	load_global_pointer
+
+	/* Load the kernel shadow call stack pointer if coming from userspace */
+	scs_load_current_if_task_changed s5
+
+	move a0, sp /* pt_regs */
+	la ra, ret_from_exception
+
+	/*
+	 * MSB of cause differentiates between
+	 * interrupts and exceptions
+	 */
+	bge s4, zero, 1f
+
+	/* Handle interrupts */
+	tail do_irq
+1:
+	/* Handle other exceptions */
+	slli t0, s4, RISCV_LGPTR
+	la t1, excp_vect_table
+	la t2, excp_vect_table_end
+	add t0, t1, t0
+	/* Check if exception code lies within bounds */
+	bgeu t0, t2, 1f
+	REG_L t0, 0(t0)
+	jr t0
+1:
+	tail do_trap_unknown
+SYM_CODE_END(handle_exception)
+ASM_NOKPROBE(handle_exception)
+        
+/*
+ * The ret_from_exception must be called with interrupt disabled. Here is the
+ * caller list:
+ *  - handle_exception
+ *  - ret_from_fork
+ */
+SYM_CODE_START_NOALIGN(ret_from_exception)
+	REG_L s0, PT_STATUS(sp)
+#ifdef CONFIG_RISCV_M_MODE
+	/* the MPP value is too large to be used as an immediate arg for addi */
+	li t0, SR_MPP
+	and s0, s0, t0
+#else
+	andi s0, s0, SR_SPP
+#endif
+	bnez s0, 1f
+
+	/* Save unwound kernel stack pointer in thread_info */
+	addi s0, sp, PT_SIZE_ON_STACK
+	REG_S s0, TASK_TI_KERNEL_SP(tp)
+
+	/* Save the kernel shadow call stack pointer */
+	scs_save_current
+
+	/*
+	 * Save TP into the scratch register , so we can find the kernel data
+	 * structures again.
+	 */
+	csrw CSR_SCRATCH, tp
+1:
+	REG_L a0, PT_STATUS(sp)
+	/*
+	 * The current load reservation is effectively part of the processor's
+	 * state, in the sense that load reservations cannot be shared between
+	 * different hart contexts.  We can't actually save and restore a load
+	 * reservation, so instead here we clear any existing reservation --
+	 * it's always legal for implementations to clear load reservations at
+	 * any point (as long as the forward progress guarantee is kept, but
+	 * we'll ignore that here).
+	 *
+	 * Dangling load reservations can be the result of taking a trap in the
+	 * middle of an LR/SC sequence, but can also be the result of a taken
+	 * forward branch around an SC -- which is how we implement CAS.  As a
+	 * result we need to clear reservations between the last CAS and the
+	 * jump back to the new context.  While it is unlikely the store
+	 * completes, implementations are allowed to expand reservations to be
+	 * arbitrarily large.
+	 */
+	REG_L  a2, PT_EPC(sp)
+	REG_SC x0, a2, PT_EPC(sp)
+
+	csrw CSR_STATUS, a0
+	csrw CSR_EPC, a2
+
+	REG_L x1,  PT_RA(sp)
+	REG_L x3,  PT_GP(sp)
+	REG_L x4,  PT_TP(sp)
+	REG_L x5,  PT_T0(sp)
+	restore_from_x6_to_x31
+
+	REG_L x2,  PT_SP(sp)
+
+#ifdef CONFIG_RISCV_M_MODE
+	mret
+#else
+	sret
+#endif
+SYM_CODE_END(ret_from_exception)
+ASM_NOKPROBE(ret_from_exception)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
