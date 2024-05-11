@@ -56,3 +56,21 @@
 
 [[PATCH\] riscv: entry: Save a0 prior syscall_enter_from_user_mode() (kernel.org)](https://lore.kernel.org/lkml/20230403-crisping-animosity-04ed8a45c625@spud/T/)
 
+
+
+
+
+# 3 解决方案
+
+## 3.1 arm64
+
+[[PATCH 0/4 v3\] arm64/ptrace: allow to get all registers on syscall traps (kernel.org)](https://lore.kernel.org/lkml/20210322225053.428615-1-avagin@gmail.com/T/#t)
+
+
+
+
+
+
+
+## 3.2 riscv: how to do?
+

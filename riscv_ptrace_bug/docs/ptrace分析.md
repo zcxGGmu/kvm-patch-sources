@@ -10,8 +10,12 @@
 
 [RISC-V Syscall 系列 2：Syscall 过程分析 - 泰晓科技 (tinylab.org)](https://tinylab.org/riscv-syscall-part2-procedure/#handle_exception)
 
-- [ ] [RISC-V Syscall 系列 3：什么是 vDSO？ - 泰晓科技 (tinylab.org)](https://tinylab.org/riscv-syscall-part3-vdso-overview/)
-- [ ] [RISC-V Syscall 系列 4：vDSO 实现原理分析 - 泰晓科技 (tinylab.org)](https://tinylab.org/riscv-syscall-part4-vdso-implementation/)
+- [x] [RISC-V Syscall 系列 3：什么是 vDSO？ - 泰晓科技 (tinylab.org)](https://tinylab.org/riscv-syscall-part3-vdso-overview/)
+- [x] [RISC-V Syscall 系列 4：vDSO 实现原理分析 - 泰晓科技 (tinylab.org)](https://tinylab.org/riscv-syscall-part4-vdso-implementation/)
+
+---
+
+- [ ] ptrace riscv内核分析
 
 # 1 syscall分析
 
@@ -271,7 +275,7 @@ ecall或者ebreak异常。ecall异常又可以分为ecall from U mode、ecall fr
 
 内存屏障相关的指令：sfence.vma。sfence.vma，和其他架构下的TLB flush指令类似，用来清空TLB，这个指令可以带ASID或address参数，表示清空对应参数标记的TLB，当ASID或者address的寄存器是X0时，表示对应的参数是无效的。
 
-### 2) 流程分析
+### 2) 流程分析: 以ptrace为例
 
 [Linux内核riscv head.S分析 | Sherlock's blog (wangzhou.github.io)](https://wangzhou.github.io/Linux内核riscv-head-S分析/)
 
@@ -425,171 +429,678 @@ struct pt_regs {
 
 
 
-#### 代码分析
+#### 代码梳理
 
-直接在代码里写注释，段注释用 `n:` 开头，行注释直接 `#`，这里把 `CONFIG_*` 都删了，只保留syscall调用链相关的代码。
+直接在代码里写注释，段注释用 `n:` 开头，行注释直接 `#`，这里把 `CONFIG_*` 都删了，只保留syscall调用链相关的代码。下面分析ptrace的整个代码流程。
 
-##### head.S
+##### 整体流程overview
 
-- [ ] 系统启动时，scratch/tp寄存器如何设置的？
+```c
+handle_exception
+    +-> la ra, ret_from_exception
+    +-> do_trap_ecall_u /* system call */
+    	+-> long syscall = regs->a7;
+            /* ??? */
+            regs->epc += 4;
+            regs->orig_a0 = regs->a0;
+    	+-> syscall_enter_from_user_mode(regs, syscall);
+		+-> if (syscall >= 0 && syscall < NR_syscalls)
+				syscall_handler(regs, syscall);
+		+-> syscall_exit_to_user_mode(regs);
+	+-> ret_from_exception
+        +-> sret //ret to user mode
+     
+// arch/riscv/include/asm/ptrace.h
+struct pt_regs {
+	unsigned long epc;
+	unsigned long ra;
+	unsigned long sp;
+	unsigned long a0;
+    
+    //...
+    
+	/* a0 value before the syscall */
+	unsigned long orig_a0;
+};
+```
 
+以上，在调用 `syscall_enter_from_user_mode` 前，存在一个备份动作：`regs->orig_a0 = regs->a0`。目前陷入S mode后，`regs->a0` 保存的是用户态的a0值，在返回用户态时必须恢复这个a0，为什么提前备份 `regs->a0` 呢，需要搞清楚两个问题：
 
+- [ ] 猜测 `regs->a0` 的值，在内核态的某些场景下会发生变化，具体什么场景？（a0保存的到底是什么？）
+- [ ] 为什么只保存 `a0`，`pt_regs` 中的其他值不需要保存吗？
 
-##### entry.S
+---
+
+##### `syscall_enter_from_user_mode`
+
+首先关注第一个问题，`a0` 究竟保存的是什么？一切都还要追溯到 `handle_exception` 中：
 
 ```assembly
-SYM_CODE_START(handle_exception)
+// arch/riscv/kernel/entry.S
+// 只关注a0相关的代码
+
+
+/* n: 在head.S里配置给CSR_TVEC */
+ENTRY(handle_exception)
+	//...
+_save_context:
+	/*
+	 * n: 保存sp到thread_info用户态指针的位置，如果是就在内核态，那么把内核栈
+	 * sp保存到了thread_info用户态栈指针的位置。
+	 *
+	 * 异常或中断来自内核或者用户态，再下面合并处理。当来自用户态时，tp的值和
+	 * scratch寄存器的值是一样的，所以这里不需要恢复tp。
+	 */
+	REG_S sp, TASK_TI_USER_SP(tp)
+	/* n: sp换成内核栈 */
+	REG_L sp, TASK_TI_KERNEL_SP(tp)
+	/*
+	 * n: 扩大栈的范围，扩大的范围用来保存相关的寄存器。移动sp其实就相当于在栈上分配空间。
+	 *    sp移动之前的值是中断或者异常打断的上下文，也就是中断或异常处理完后要恢复的值。
+	 */
+	addi sp, sp, -(PT_SIZE_ON_STACK)
+	/*
+	 * n: 下面的一段代码把各个系统寄存器保存到栈上刚刚开辟出来的空间, 注意需要
+	 * 特殊处理的是sp(x2)和tp(x4)。当前的sp，由于上面的变动已经不是需要保存的sp，
+	 * 但是，之前我们已经把需要保存的sp放到了thread_info里，所以下面把thread_info
+	 * 里的sp取出后再入栈。
+	 */
+    //...
+    REG_S x10, PT_A0(sp)
+        
+    /*
+	 * n: 上面已经保存了寄存器现场，下面可以使用系统寄存器了，s0保存用户态sp。
+	 * 把task_struct里保存的用户态栈指针提取出来，然后在后面保存到内核栈上。
+	 */
+	REG_L s0, TASK_TI_USER_SP(tp)
+	/* n: todo */
+#ifdef CONFIG_CONTEXT_TRACKING
+	/* If previous state is in user mode, call context_tracking_user_exit. */
+	li   a0, SR_PP
+	and a0, s1, a0
+	bnez a0, skip_context_tracking
+	call context_tracking_user_exit
+skip_context_tracking:
+    /* n: 上面可以知道sp就是pt_regs的地址，a0存放pt_regs的地址 */
+	move a0, sp /* pt_regs */  
+      
+//... 
+```
+
+现在明确了：目前 `a0` 寄存器上保存的是 `pt_regs` 的地址值，`regs->a0` 保存的是用户态的a0值。
+
+---
+
+接下来，看`regs->a0` 在内核态下什么场景会被修改？`syscall_enter_from_user_mode` 代码如下：
+
+```c
+syscall_enter_from_user_mode(regs, syscall);
++-> enter_from_user_mode(regs);
+	+-> arch_enter_from_user_mode(regs);
++-> local_irq_enable();
++-> syscall_enter_from_user_mode_work(regs, syscall);
+	+-> //...
+
+```
+
+可以看到，`syscall_enter_from_user_mode` 中调用了 `local_irq_enable` 使能了本地S mode中断，这意味着，中断上下文是可以抢占当前内核态执行流的，由于 `stvec` 从未修改，当S mode interrupt触发时控制流跳转至 `handle_exception`，该函数开始时会对当前的trap来自于哪个特权级进行判断，
+
+```assembly
+ENTRY(handle_exception)
 	/*
 	 * If coming from userspace, preserve the user thread pointer and load
 	 * the kernel thread pointer.  If we came from the kernel, the scratch
 	 * register will contain 0, and we should continue on the current TP.
 	 */
-	csrrw tp, CSR_SCRATCH, tp # 
-	bnez tp, .Lsave_context
+	/*
+	 * n: 交换tp寄存器和scratch寄存器里的值。如果exception从用户态进来，scratch
+	 * 的值应该是task_struct(下面在离开内核的时候，会把用户进程的task_struct
+	 * 指针赋给tp)，如果exception从内核态进来，tp应该是当前线程的task_struct
+	 * 指针，scratch应该是0。
+	 *
+	 * 所以，下面紧接着的处理中，如果从内核进来，要恢复下tp。
+	 *
+	 * 总结下在用户态和内核态时tp和scratch的值是什么：
+	 *
+	 *  +----------+--------------+---------------+
+	 *  |          | user space   |   kernel      |
+	 *  +----------+--------------+---------------+
+	 *  | tp:      | tls base     |   task_struct |
+	 *  +----------+--------------+---------------+
+	 *  | scratch: | task_struct  |   0           |
+	 *  +----------+--------------+---------------+
+	 *
+	 * 注意：配置tp为tls地址的函数是：copy_thread，如果用户态没有使用TLS，tp
+	 *       在用户态的值是？
+	 */
+	csrrw tp, CSR_SCRATCH, tp
+	/* n: tp不为0，异常来自用户态，直接跳到上下文保存的地方 */
+	bnez tp, _save_context
 
-.Lrestore_kernel_tpsp:
+_restore_kernel_tpsp:
+	/*
+	 * n: csrr伪指令，把scratch寄存器的值写入tp，上面为了判断是否在内核把tp
+	 * 的值和CSR_SCRATCH的值做了交换。这里恢复tp寄存器。
+	 */
 	csrr tp, CSR_SCRATCH
+	/* n: 把内核sp保存到内核thread_info上 */
 	REG_S sp, TASK_TI_KERNEL_SP(tp)
-
-.Lsave_context:
+_save_context:
+	/*
+	 * n: 保存sp到thread_info用户态指针的位置，如果是就在内核态，那么把内核栈
+	 * sp保存到了thread_info用户态栈指针的位置。
+	 *
+	 * 异常或中断来自内核或者用户态，再下面合并处理。当来自用户态时，tp的值和
+	 * scratch寄存器的值是一样的，所以这里不需要恢复tp。
+	 */
 	REG_S sp, TASK_TI_USER_SP(tp)
+	/* n: sp换成内核栈 */
 	REG_L sp, TASK_TI_KERNEL_SP(tp)
-	addi sp, sp, -(PT_SIZE_ON_STACK)
-	REG_S x1,  PT_RA(sp)
-	REG_S x3,  PT_GP(sp)
-	REG_S x5,  PT_T0(sp)
-	save_from_x6_to_x31
-
-	/*
-	 * Disable user-mode memory access as it should only be set in the
-	 * actual user copy routines.
-	 *
-	 * Disable the FPU/Vector to detect illegal usage of floating point
-	 * or vector in kernel space.
-	 */
-	li t0, SR_SUM | SR_FS_VS
-
-	REG_L s0, TASK_TI_USER_SP(tp)
-	csrrc s1, CSR_STATUS, t0
-	csrr s2, CSR_EPC
-	csrr s3, CSR_TVAL
-	csrr s4, CSR_CAUSE
-	csrr s5, CSR_SCRATCH
-	REG_S s0, PT_SP(sp)
-	REG_S s1, PT_STATUS(sp)
-	REG_S s2, PT_EPC(sp)
-	REG_S s3, PT_BADADDR(sp)
-	REG_S s4, PT_CAUSE(sp)
-	REG_S s5, PT_TP(sp)
-
-	/*
-	 * Set the scratch register to 0, so that if a recursive exception
-	 * occurs, the exception vector knows it came from the kernel
-	 */
-	csrw CSR_SCRATCH, x0
-
-	/* Load the global pointer */
-	load_global_pointer
-
-	/* Load the kernel shadow call stack pointer if coming from userspace */
-	scs_load_current_if_task_changed s5
-
-	move a0, sp /* pt_regs */
-	la ra, ret_from_exception
-
-	/*
-	 * MSB of cause differentiates between
-	 * interrupts and exceptions
-	 */
-	bge s4, zero, 1f
-
-	/* Handle interrupts */
-	tail do_irq
-1:
-	/* Handle other exceptions */
-	slli t0, s4, RISCV_LGPTR
-	la t1, excp_vect_table
-	la t2, excp_vect_table_end
-	add t0, t1, t0
-	/* Check if exception code lies within bounds */
-	bgeu t0, t2, 1f
-	REG_L t0, 0(t0)
-	jr t0
-1:
-	tail do_trap_unknown
-SYM_CODE_END(handle_exception)
-ASM_NOKPROBE(handle_exception)
-        
-/*
- * The ret_from_exception must be called with interrupt disabled. Here is the
- * caller list:
- *  - handle_exception
- *  - ret_from_fork
- */
-SYM_CODE_START_NOALIGN(ret_from_exception)
-	REG_L s0, PT_STATUS(sp)
-#ifdef CONFIG_RISCV_M_MODE
-	/* the MPP value is too large to be used as an immediate arg for addi */
-	li t0, SR_MPP
-	and s0, s0, t0
-#else
-	andi s0, s0, SR_SPP
-#endif
-	bnez s0, 1f
-
-	/* Save unwound kernel stack pointer in thread_info */
-	addi s0, sp, PT_SIZE_ON_STACK
-	REG_S s0, TASK_TI_KERNEL_SP(tp)
-
-	/* Save the kernel shadow call stack pointer */
-	scs_save_current
-
-	/*
-	 * Save TP into the scratch register , so we can find the kernel data
-	 * structures again.
-	 */
-	csrw CSR_SCRATCH, tp
-1:
-	REG_L a0, PT_STATUS(sp)
-	/*
-	 * The current load reservation is effectively part of the processor's
-	 * state, in the sense that load reservations cannot be shared between
-	 * different hart contexts.  We can't actually save and restore a load
-	 * reservation, so instead here we clear any existing reservation --
-	 * it's always legal for implementations to clear load reservations at
-	 * any point (as long as the forward progress guarantee is kept, but
-	 * we'll ignore that here).
-	 *
-	 * Dangling load reservations can be the result of taking a trap in the
-	 * middle of an LR/SC sequence, but can also be the result of a taken
-	 * forward branch around an SC -- which is how we implement CAS.  As a
-	 * result we need to clear reservations between the last CAS and the
-	 * jump back to the new context.  While it is unlikely the store
-	 * completes, implementations are allowed to expand reservations to be
-	 * arbitrarily large.
-	 */
-	REG_L  a2, PT_EPC(sp)
-	REG_SC x0, a2, PT_EPC(sp)
-
-	csrw CSR_STATUS, a0
-	csrw CSR_EPC, a2
-
-	REG_L x1,  PT_RA(sp)
-	REG_L x3,  PT_GP(sp)
-	REG_L x4,  PT_TP(sp)
-	REG_L x5,  PT_T0(sp)
-	restore_from_x6_to_x31
-
-	REG_L x2,  PT_SP(sp)
-
-#ifdef CONFIG_RISCV_M_MODE
-	mret
-#else
-	sret
-#endif
-SYM_CODE_END(ret_from_exception)
-ASM_NOKPROBE(ret_from_exception)
+	
+	/* 和U mode->S mode一样，S mode->S mode把这些寄存器值保存到内核栈空间的pt_regs位置处 */
+	REG_S x10, PT_A0(sp)
+	
+	
 ```
+
+- [ ] 和 `U mode -> S mode` 一样，`S mode -> S mode` 也需要把这些寄存器值保存到内核栈，这需要重新开辟一块 `PT_SIZE_ON_STACK` 大小的栈空间，同时我们把原来 `pt_regs` 的地址值 (即 `regs->a0`) 备份至。。。
+
+
+
+##### `sys_ptrace` 分支处理
+
+```c
+asmlinkage long sys_ptrace(long request, long pid, unsigned long addr,
+			   unsigned long data);
+
+SYSCALL_DEFINE4(ptrace, long, request, long, pid, unsigned long, addr,
+		unsigned long, data)
+{
+	struct task_struct *child;
+	long ret;
+
+	if (request == PTRACE_TRACEME) {
+		ret = ptrace_traceme();
+		goto out;
+	}
+
+	child = find_get_task_by_vpid(pid);
+	if (!child) {
+		ret = -ESRCH;
+		goto out;
+	}
+
+	if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
+		ret = ptrace_attach(child, request, addr, data);
+		goto out_put_task_struct;
+	}
+
+	ret = ptrace_check_attach(child, request == PTRACE_KILL ||
+				  request == PTRACE_INTERRUPT);
+	if (ret < 0)
+		goto out_put_task_struct;
+
+	ret = arch_ptrace(child, request, addr, data);
+	if (ret || request != PTRACE_DETACH)
+		ptrace_unfreeze_traced(child);
+
+ out_put_task_struct:
+	put_task_struct(child);
+ out:
+	return ret;
+}
+```
+
+# 2 ptrace自顶向下
+
+[articles/20220829-ptrace.md · aosp-riscv/working-group - Gitee.com](https://gitee.com/aosp-riscv/working-group/blob/master/articles/20220829-ptrace.md#5-single-step-单步执行)
+
+[linux-沙盒入门，ptrace从0到1-腾讯云开发者社区-腾讯云 (tencent.com)](https://cloud.tencent.com/developer/article/1799705)
+
+[Linux内核原理分析：利用ptrace系统调用实现一个软件调试器_linux ptrace-CSDN博客](https://blog.csdn.net/qq_42935201/article/details/122672822)
+
+## 2.0 ptrace from 0 to 1
+
+### 1) 初识
+
+ptrace在linux 反调试技术中的地位就如同nc在安全界的地位，ptrace使用场景：
+
+* 编写动态分析工具，如：`gdb`、`strace`；
+* 反追踪，一个进程只能被一个进程追踪 (一个进程能同时追踪多个进程)，若此进程已被追踪，其他基于ptrace的追踪器将无法再追踪此进程，更进一步可以实现子母进程双线执行，动态解密代码等更高级的反分析技术；
+* 代码注入，往其他进程里注入代码；
+* 不退出进程，进行在线升级；
+
+Ptrace 可以让父进程控制子进程运行，并可以检查和改变子进程的核心image的功能（Peek and Poke 在系统编程中是很知名的叫法，指的是直接读写内存内容）。ptrace 主要跟踪的是进程运行时的状态，直到收到一个终止信号结束进程，这里的信号如果是我们给程序设置的断点，则进程被中止，并通知其父进程，在进程中止的状态下，进程的内存空间可以被读写。当然父进程还可以使子进程继续执行，并选择是否忽略引起中止的信号，ptrace 可以让一个进程监视和控制另一个进程的执行，并修改被监视进程的内存、寄存器等，主要应用于断点调试和系统调用跟踪，strace和gdb工具就是基于ptrace编写的。
+
+> 注：ptrace 是linux的一种系统调用，所以当我们用gdb进行attach其他进程的时候，需要root权限。
+
+在Linux系统中，进程状态除了我们所熟知的TASK_RUNNING，TASK_INTERRUPTIBLE，TASK_STOPPED等，还有一个TASK_TRACED，而TASK_TRACED将调试程序断点成为可能。
+
+1. **R (TASK_RUNNING)，可执行状态。**
+2. **S (TASK_INTERRUPTIBLE)，可中断的睡眠状态。**
+3. **D (TASK_UNINTERRUPTIBLE)，不可中断的睡眠状态。**
+4. **T (TASK_STOPPED or TASK_TRACED)，暂停状态或跟踪状态。**
+
+当使用了 ptrace 跟踪后，所有发送给被跟踪的子进程的信号 (除了SIGKILL)，都会被转发给父进程，而子进程则会被阻塞，这时子进程的状态就会被系统标注为 `TASK_TRACED`，而父进程收到信号后，就可以对停止下来的子进程进行检查和修改，然后让子进程继续运行。
+
+>***什么是信号？***
+>
+>一个信号就是一条消息，它通知进程系统中发生了一个某种类型的事件，信号是多种多样的，并且一个信号对应一个事件，这样才能做到当进程收到一个信号后，知道到底是一个什么事件，应该如何处理（但是要保证必须识别这个信号），个人理解信号就是操作系统跟进程沟通的一个有特殊含义的语句。
+>
+>我们可以直接通过 `kill -l` ，来查看信息的种类：
+>
+><img src="https://ask.qcloudimg.com/http-save/yehe-8119233/rlxk48n3k5.png" alt="img" style="zoom:67%;" />
+>
+>一共62种，其中1~31是非可靠信号，34~64是可靠信号 (非可靠信号是早期Unix系统中的信号，后来又添加了可靠信号，方便用户自定义信号，这二者之间具体的区别在下文中会提到)
+
+---
+
+```c
+#include <sys/ptrace.h>       
+long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
+```
+
+- `request`: 表示要执行的操作类型。反调试会用到 `PT_DENY_ATTACH`，调试会用到 `PTRACE_ATTACH`；
+- `pid`: 要操作的目标进程ID；
+- `addr`: 要监控的目标内存地址；
+- `data`: 保存读取出或者要写入的数据；
+
+### 2) 内核实现
+
+ptrace的内核实现在 `kernel/ptrace.c` 文件中，直接看内核接口是 `SYSCALL_DEFINE4(ptrace, ...)`，代码如下：
+
+```c
+SYSCALL_DEFINE4(ptrace, long, request, long, pid, unsigned long, addr,unsigned long, data)
+{
+    struct task_struct *child;
+    long ret;
+       
+    if (request == PTRACE_TRACEME)
+        {
+      ret = ptrace_traceme();
+      if (!ret)
+        arch_ptrace_attach(current);
+        goto out;
+    }
+       
+    child = ptrace_get_task_struct(pid);
+    if (IS_ERR(child))
+        {
+      ret = PTR_ERR(child);
+      goto out;
+    }
+       
+    if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
+      ret = ptrace_attach(child, request, addr, data);
+      /*
+       * Some architectures need to do book-keeping after
+       * a ptrace attach.
+       */
+      if (!ret)
+        arch_ptrace_attach(child);
+      goto out_put_task_struct;
+    }
+       
+    ret = ptrace_check_attach(child, request == PTRACE_KILL ||request == PTRACE_INTERRUPT);
+    if (ret < 0)
+      goto out_put_task_struct;
+    ret = arch_ptrace(child, request, addr, data);
+    if (ret || request != PTRACE_DETACH)
+      ptrace_unfreeze_traced(child);
+    
+     out_put_task_struct:
+      put_task_struct(child);
+     out:
+      return ret;
+}
+```
+
+
+
+
+
+## 2.1 ptrace uapi intro
+
+> NAME ptrace - process trace
+>
+> SYNOPSIS #include <sys/ptrace.h>
+>
+> ```c
+>   long ptrace(enum __ptrace_request request, pid_t pid,
+>               void *addr, void *data);
+> ```
+
+---
+
+ptrace 从名字上看是用于进程跟踪，它提供了一个进程 A 观察和控制另外一个进程 B 执行的能力，这里的进程 A 在术语上称之为 `tracer`，而进程 B 则称之为 `tracee`。
+
+ptrace 函数原型中，参数 `request` 是一系列以 `PTRACE_` 为前缀的枚举值，用于通知内核执行 ptrace 的操作类型，具体可以查看 man 手册。pid 是指定接受 ptrace request 的对象（严格说是线程 ID，因为按照 man 手册的说法 `"tracee" always means "(one) thread", never "a (possibly multithreaded) process"`），addr 和 data 的具体含义视 request 的不同而不同，具体要查看 man 手册。
+
+如果要让 `tracer` 能够 tracing `tracee`，首先要在两者之间建立 tracing 关系。`tracer` 进程和 `tracee` 进程之间，可以采取以下两种方式之一建立 tracing 关系：
+
+- **第一种方式是：**tracer 进程利用 fork 创建子进程，子进程首先调用 `ptrace(PTRACE_TRACEME, 0, ...)` 成为 tracee，建立了与父进程 tracer 的 tracing 关系，然后 tracee 子进程再调用 `execve` 加载需要被 trace 的程序。本文 example-code 主要采用这种方式。
+- **第二种方式是：**tracer 进程可以利用 `ptrace(PTRACE_ATTACH，pid,...)` 指定 tracee 的进程号来建立 tracing 关系。一旦 attach 成功，tracer 变成 tracee 的父进程 (用 ps 可以看到)。tracing 关系建立后可以调用 `ptrace(PTRACE_DETACH，pid,...)` 解除。注意 attach 进程时的权限问题，如一个非 root 权限的进程是不能 attach 到一个 root 权限的进程上的。
+
+当 tracing 关系建立后，tracer 可以控制 tracee 的执行，在 tracer 的控制下（即调用各种 ptrace request），内核通过向 tracee 发送信号的方式将其暂停，即 tracee 发生阻塞，任务状态就会被系统标注为 `TASK_TRACED`，即使这个信号被 tracee 忽略（ignore）也无法阻止 tracee 被暂停；但有个信号例外，就是 SIGKILL，也就是说如果 tracee 收到 SIGKILL 仍然会按照默认的方式处理，如果没有注册自己的 handler 默认 tracee 仍然会被杀死。
+
+一旦 tracee 被暂停，tracer 可以通过调用 `waitpid` 获知 tracee 状态的变化，以及状态变化的原因（通过 `waitpid` 返回的 `wstatus`）。此时 tracer 就可以对停止下来的 tracee 进行检查，甚至修改当前寄存器上下文和内存的值，或者让 tracee 继续运行。
+
+---
+
+先写一个简单的 tracee 程序，为排除干扰实现一个干净的程序，我们这里采用汇编，总共 8 条指令，期间调用两次系统调用，第一次调用 `write` 在 stdout 上打印 "Hello\n" 一共 6 个字符，第二次调用 `exit` 结束进程。
+
+```assembly
+	.section .rodata
+msg:
+	.string "Hello\n"
+
+	.text
+	.globl _start
+_start:
+	# write(int fd, const void *buf, size_t count);
+	movq $1, %rax		# __NR_write
+	movq $1, %rdi		# fd = 1
+	leaq msg(%rip), %rsi	# buf = msg
+	movq $6, %rdx		# count = 6
+	syscall
+	
+	# exit(int status);
+	movq $60, %rax		# __NR_exit
+	xor %rdi, %rdi		# status = 0
+	syscall
+```
+
+tracer 程序如下：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <assert.h>
+
+#include <sys/ptrace.h>
+#include <sys/user.h> // user_regs_struct 
+#include <linux/elf.h> // NT_PRSTATUS
+#include <sys/uio.h> // struct iovec
+
+void info_registers(pid_t pid)
+{
+	long retval;
+	struct user_regs_struct regs;
+	struct iovec pt_iov = {
+		.iov_base = &regs,
+		.iov_len = sizeof(regs),
+	};
+	retval = ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &pt_iov);
+	assert(-1 != retval);
+
+	// just print some important registers we care about
+	printf( "--------------------------\n"
+		"rax: 0x%llx\n"
+		"rdi: 0x%llx\n"
+		"rsi: 0x%llx\n"
+		"rdx: 0x%llx\n",
+		regs.rax,
+		regs.rdi,
+		regs.rsi,
+		regs.rdx);
+}
+
+int main(void)
+{
+	int wstatus;
+	long retval;
+	pid_t pid;
+
+	pid = fork();
+	assert(-1 != pid);
+
+	if (0 == pid) {
+		// child process starts ......
+		retval = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+		assert(-1 != retval);
+
+		// a successful call of execl will make tracee received
+		// a SIGTRAP, which gives the parent tracer a chance to 
+		// gain control before the new program begins execution.
+		retval = execl("./tracee", "tracee", NULL);
+		assert(-1 != retval);
+	}
+
+	// parent process goes here
+
+	// wait no-timeout till status of child is changed
+	retval = waitpid(pid, &wstatus, 0);
+	assert(-1 != retval);
+	
+	assert(WIFSTOPPED(wstatus));
+	printf("tracer: tracee got a signal and was stopped: %s\n", strsignal(WSTOPSIG(wstatus)));
+
+	printf("tracer: request to query more information from the tracee\n");
+	info_registers(pid);
+	
+	// continue the tracee
+	printf("tracer: request tracee to continue ...\n");
+	retval = ptrace(PTRACE_CONT, pid, NULL, NULL);
+	assert(-1 != retval);
+
+	return 0;
+}
+```
+
+- 其中 tracer 在收到内核的通知（实际是通过 waitpid 的方式等待内核的通知）知道 tracee 被停止后，可以通过 `ptrace(PTRACE_GETREGSET, ...)` 查询 tracee 进程的寄存器状态。这里有点类似我们在 gdb 中程序暂停后输入 `info registers`。
+- 最后 tracer 通过调用 `ptrace(PTRACE_CONT, ...` 通知内核继续执行 tracee，所以最后我们看到 “Hello” 输出，这里就好比 gdb 里输入 `continue` 命令。
+- 这个例子里 tracee 之所以能够暂停，实际上是内核的一种缺省行为，即 tracee 在调用 `ptrace(PTRACE_TRACEME, ...)` 申请自己成为 tracee 后，再调用 `excec` 这些系统调用，则内核默认会在实际执行新程序（这里是 tracee）之前发送一个 SIGTRAP 信号给 tracee 先将 tracee 进程挂起，这里我们在 tracer 程序里也验证了这个信号。
+
+## 2.2 example: code/test.c
+
+prtace既能用作调试，也能用作反调试，当传入的request不同时，就可以切换到不同的功能了。在使用ptrace之前，需要在两个进程间建立追踪关系，其中tracee可以不做任何事，也可使用prctl和PTRACE_TRACEME来进行设置，ptrace编程的主要部分是tracer，它可以通过附着的方式与tracee建立追踪关系，建立之后，可以控制tracee在特定的时候暂停并向tracer发送相应信号，而tracer则通过循环等待 `waitpid` 来处理tracee发来的信号，如下图所示：
+
+<img src="https://ask.qcloudimg.com/http-save/yehe-8119233/e2yfg93jx2.png" alt="img" style="zoom:80%;" />
+
+在进行追踪前，需要先建立追踪关系，相关request有如下4个：
+
+> * `PTRACE_TRACEME`：tracee表明自己想要被追踪，这会自动与父进程建立追踪关系，这也是唯一能被tracee使用的request，其他的request都由tracer指定；
+> * `PTRACE_ATTACH`：tracer用来附着一个进程tracee，以建立追踪关系，并向其发送SIGSTOP信号使其暂停；
+> * `PTRACE_SEIZE`：像PTRACE_ATTACH附着进程，但它不会让tracee暂停，addr参数须为0，data参数指定一位ptrace选项； 
+> * `PTRACE_DETACH`：解除追踪关系，tracee将继续运行。
+
+其中建立关系时，tracer使用如下方法：
+
+```c
+ptrace(PTRACE_ATTACH, pid, 0, 0);
+/*或*/
+ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_flags); /*指定追踪选项立即生效*/
+```
+
+---
+
+`execl()` 函数，对应的系统调用为 `__NR_execve`，系统调用值为 59。库函数 `execve` 调用链如下：
+
+<img src="https://ask.qcloudimg.com/http-save/yehe-8119233/50w0yc84m8.png" alt="img" style="zoom: 67%;" />
+
+---
+
+以下代码采用 `PTRACE_TRACEME` 的方式建立trace关系，同时利用tracer修改tracee寄存器的值，代码如下：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <asm/ptrace.h>
+#include <sys/uio.h>
+#include <linux/elf.h> 
+#include <sys/ptrace.h> /* ptrace(2), PTRACE_*, */
+#include <sys/types.h>  /* pid_t, size_t, */
+#include <stdlib.h>     /* NULL, */
+#include <stddef.h>     /* offsetof(), */
+#include <sys/user.h>   /* struct user*, */
+#include <errno.h>      /* errno, */
+#include <assert.h>     /* assert(3), */
+#include <sys/wait.h>   /* waitpid(2), */
+#include <string.h>     /* memcpy(3), */
+#include <stdint.h>     /* uint*_t, */
+#include <sys/uio.h>    /* process_vm_*, struct iovec, */
+#include <unistd.h>     /* sysconf(3), */
+#include <sys/mman.h>
+
+int main(int argc, char* argv[])
+{       pid_t pid = fork();
+        if(pid < 0)
+        {
+                perror("fork error");
+                exit(-1);
+        }
+        else if (pid == 0)
+        {
+                static char *newargv[] = { NULL, "hello", "world", NULL };
+                static char *newenviron[] = { "test env", "hello new env", NULL };
+                long ret_val = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+                if(ret_val <0 )
+                {
+                        perror("ptrace");
+                        exit(-1);
+                }
+                kill(getpid(),SIGSTOP); //sig self to get traced
+                for(int i=0;i<10;i++)
+                {
+                    int x = getpid();
+                    if(x<0) 
+                    {
+                        printf("yes!\n");
+                    }
+                }
+                newargv[0] = "argv0_progarm_name_test";
+                execve("./test", newargv, newenviron);
+                exit(0);
+        }
+        else 
+        {
+            while(1)
+            {
+                    int status;
+                    pid_t wait_pid = waitpid(-1, &status, 0);
+                    if(wait_pid < 0)
+                    {
+                            perror("waitpid");
+                            exit(-1);
+                    }
+                    if(WIFEXITED(status))
+                    {
+                            printf("child exit success!\n");
+                            exit(0);
+                    }
+                    else if (WIFSTOPPED(status))
+                    {
+                            struct user_regs_struct _regs;
+                            struct iovec regs;
+                            regs.iov_base = &_regs;
+                            regs.iov_len  = sizeof(_regs);
+                            long ret_val=ptrace(PTRACE_GETREGSET,wait_pid,NT_PRSTATUS,&regs);
+                            if(ret_val < 0)
+                            {
+                                    perror("ptrace can't get arguments");
+                                    kill(wait_pid, SIGKILL);
+                                    exit(-1);
+                            }
+                            if(_regs.a7 == 172) //getpid syscall
+                            {
+                                    _regs.a7 = 0;
+                                    ret_val = ptrace(PTRACE_SETREGSET,wait_pid,NT_PRSTATUS,&regs);
+                                    if(ret_val <0 )
+                                    {
+                                            perror("ptrace can't set arguments");
+                                            kill(wait_pid, SIGKILL);
+                                            exit(-1);
+                                    }
+                            }
+                            else if (_regs.a7 == 221)  //execve syscall
+                            {
+                                    static int is_first = 1;
+                                    if(is_first)
+                                    {
+                                            is_first = !is_first;
+                                            _regs.a0 = 0;
+                                            //_regs.a1 = 0;
+                                            _regs.a2 = 0;
+                                            //_regs.a3 = 0;
+                                            //_regs.a4 = 0;
+                                            //_regs.a5 = 0;
+                                            //_regs.a6 = 0;
+                                            ret_val = ptrace(PTRACE_SETREGSET,wait_pid,NT_PRSTATUS,&regs);
+                                            if(ret_val <0 )
+                                            {
+                                                    perror("ptrace can't set arguments");
+                                                    kill(wait_pid, SIGKILL);
+                                                    exit(-1);
+                                            }
+                                    }
+                            }
+                            ptrace(PTRACE_SYSCALL, wait_pid, 0, 0);
+                    }
+                    else
+                    {
+                            printf("child exit excption!\n");
+                            exit(-1);
+                    }
+            }
+        }
+        return 0;
+}
+```
+
+---
+
+```c
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+
+
+int main(int argc, char* argv[], char* envp[])
+{
+        printf("\n================================\n");
+        for(int i=0;i<argc;i++)
+        {
+                printf("%s ",argv[i]);
+        }
+        printf("\n================================\n");
+        char** ptr = envp;
+        printf("\n==================envp==========\n");
+        for(;(*ptr) != 0;)
+        {
+                printf("%s ",*ptr);
+                ptr++;
+        }
+        printf("\n================================\n");
+
+        return 0;
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
